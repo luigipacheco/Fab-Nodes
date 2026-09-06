@@ -1,0 +1,19 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Editors / IDE
+.vscode/
+.idea/
+
+# Arduino build output
+build/
+*.bin.tmp
+
+# Node secrets — commit only the .example variants
+# (config.h files currently tracked stay tracked; new nodes should use config.h.example)
+
+# OS cruft
+.DS_Store
+Thumbs.db
