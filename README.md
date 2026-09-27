@@ -1,9 +1,15 @@
-# FabNodes Protocol v1.0  
+# FabNodes Core
 ## Raw Scalar + Array MQTT Architecture
 
 FabNodes are modular hardware nodes designed to expose direct, human-readable hardware functionality over MQTT with minimal firmware complexity.
 
 High-level logic, scaling, mapping, and orchestration are handled externally (MQTTouch, Blender, automation systems).
+
+**Version:** 0.3.0 · **Protocol:** fabnodes/1.1 · **License:** MIT
+
+Build an ESP32 node with the FabNodesCore library and the
+[fab-hello example](examples/fab-hello/TUTORIAL.md). The runtime handles setup,
+WiFi/MQTT connections, device discovery, diagnostics and software stop.
 
 ---
 
@@ -504,4 +510,6 @@ The semicolon form (`r,g,b;r,g,b`) is a legacy alias that existing nodes may kee
 
 FabNodes Protocol v1.1
 Raw Scalar + Array Edition
+
+FabNodesCore library: **0.3.0** (Arduino and PlatformIO).
 

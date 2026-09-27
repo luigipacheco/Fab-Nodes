@@ -1,44 +1,46 @@
 # FabNodesCore
 
-FabNodesCore is the shared workflow library for FabNodes sketches in this repo.
+**Version:** 0.3.0 · **Protocol:** fabnodes/1.1 · **License:** MIT
 
-Current scope:
+An ESP32 library for building MQTT-connected sensors and actuators. Define
+signals and hardware callbacks; the runtime handles setup, connectivity,
+discovery and diagnostics.
 
-- protocol constants such as the setup AP SSID, manifest root, and `system/estop`
-- node-name sanitizing
-- JSON string escaping for manifest payloads
-- default node-name and chip-ID generation
-- shared network settings load/save/clear through `Preferences`
-- common `broker=` / `mqtt=` serial command parsing
-- signal model (`FabSignal`) and manifest builder — protocol `fabnodes/1.1`: chip `id`, `$state` reference, standard `status/safe` + `diag/*` descriptors, enum `options` for string signals (`FAB_SUB_ENUM("mode", FAB_CONTROL, "velocity,move,position")` → manifest `"options":[...]` → selector in the controlling UI; payloads stay strings)
-- availability (`FabNodesNet.h`): `fabMqttConnectWithState()` connects with a `$state` Last Will (`offline`, QoS 1, retained) and publishes retained `online`
-- latched emergency stop helpers (`FabEstopState`, `fabEstopUpdate`) — `system/estop = 1` forces safe state until an explicit `0`
-- retained-control replay guard (`FabControlReplayGuard`) — control topics must never be published retained
-- standard diagnostics publisher (`fabServiceDiagnostics`: `diag/rssi`, `diag/ip`, `diag/uptime`)
-- mDNS: `fabStartMdns()` plus `.local` broker resolution via `fabApplyBrokerEndpoint()` (default broker: `fabnodes.local`)
-- **`FabNodesRuntime.h`** — full node lifecycle (settings, shared captive portal, WiFi/MQTT with fail-safe transitions, e-stop, manifest, diagnostics, serial with custom-command hooks) as a header-only class; include it explicitly (`#include <FabNodesRuntime.h>`), it is not pulled in by `FabNodesCore.h`. Used by every node except fab-knob (custom portal + foreign-topic subscriptions by design).
-- **Signal binding layer** (in `FabNodesRuntime.h`) — typed control callbacks and policy publishing driven by the signal metadata, so sketches skip suffix dispatch, payload parsing, and deadband bookkeeping:
-  - `fab.onBool/onInt/onFloat/onString(suffix, fn)` — runtime parses the payload, clamps numerics to the signal's declared min/max, validates strings against enum `options` (unknown values dropped with a serial note), then calls the handler. Register after `fab.begin()`; capturing lambdas work (`fab.onBool(sfx[i], [i](bool on){ apply(i, on); })`). Bindings win over `on_control`; unmatched suffixes fall through to it.
-  - `fab.set(suffix, value[, decimals])` — publishes honoring the signal's declared `publish_policy`/`deadband`/min-max intervals and formats by declared type (bool → `0`/`1`, int → integer). A publish that doesn't go out (MQTT down) isn't recorded, so the value retries next sample. `fab.signalValue(suffix)` returns the last sampled value (NAN before the first) for displays.
-  - Adopters: fab-relay + fab-servo (bindings), fab-sense (`fab.set` replaced its hand-rolled deadband/heartbeat channels).
-- **`FabNodesHeater.h`** — reusable closed-loop heater controller (`FabHeater`): PI + time-proportional switching for SSR/MOSFET heaters, with sensor-fault-off, latched overtemp cutoff, and `forceOff()` for safe states. Standalone include, dependency-free. First consumer: fab-struder.
-- **`FabNodesDisplay.h`** — shared OLED debug pages for any Adafruit_GFX-compatible display: `fabDrawSetupPage()` (captive-portal instructions) and `fabDrawStatusPage()` (the FabNodes face — happy idle / poop-face busy — wifi icon, name/IP/MQTT/e-stop, value lines). The bitmaps come from the original FabStruder UI and are the shared design language; fab-struder keeps its rich custom page as the flagship example, fab-sense shows the minimal adoption (`SENSE_OLED=1`, ~30 lines). Standalone include; serial debugging needs nothing — every runtime node has `status`/`topics`/`values` built in.
+## Get started
 
-Current adopters (all nodes): fab-led, fab-streamer, fab-struder,
-fab-stepper, fab-relay, fab-panel, fab-sense, fab-servo on the full runtime;
-fab-knob on the protocol helpers only (custom lifecycle by design).
-
-## Include pattern
-
-The library ships `library.properties` (Arduino) and `library.json`
-(PlatformIO). Node projects consume it via `lib_extra_dirs = ../libraries`
-in their `platformio.ini`:
+Use [fab-hello](../../examples/fab-hello/TUTORIAL.md) as a working template.
+Install the library with Arduino, or point PlatformIO's `lib_extra_dirs` at
+the directory containing `FabNodesCore`.
 
 ```cpp
 #include <FabNodesCore.h>
+#include <FabNodesRuntime.h>
 ```
 
-## Next candidates for extraction
+## Features
 
-- common captive-portal save flow
-- shared Wi-Fi and MQTT reconnect policy
+- Captive-portal WiFi/MQTT setup with settings saved in ESP32 Preferences.
+- Retained manifests describing each signal's topic, type, direction and range.
+- Online/offline availability through MQTT Last Will, plus diagnostic heartbeats.
+- Latched `system/estop` handling and a callback for safe output states on
+  connectivity loss. This is a software stop, not a safety-rated function.
+- Typed control bindings, range checks and enum validation.
+- Publishing policies with deadbands and minimum/maximum intervals.
+- mDNS naming and broker discovery, plus serial setup/debug commands.
+
+## API guide
+
+| API | Use |
+|---|---|
+| `FabSignal` | Describe inputs, outputs, units, ranges and publishing policies |
+| `fab.begin(config)` / `fab.loop()` | Start and service the node runtime |
+| `fab.onBool/onInt/onFloat/onString(suffix, callback)` | Handle typed control values; register after `begin()` |
+| `fab.set(suffix, value)` | Publish a value using the signal's declared policy |
+| `fab.signalValue(suffix)` | Read the last sampled value for a display |
+| `on_safe_state` callback | Put hardware outputs into their defined safe state |
+
+`FabNodesHeater.h` provides PI heater control with sensor-fault and overtemperature
+handling. `FabNodesDisplay.h` provides setup/status pages for Adafruit_GFX-compatible
+displays. Include these helpers when your hardware needs them.
+
+See the [protocol reference](../../README.md) for topics, payloads and manifests.
