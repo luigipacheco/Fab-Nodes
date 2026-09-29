@@ -1,6 +1,6 @@
 # FabNodesCore
 
-**Version:** 0.3.0 · **Protocol:** fabnodes/1.1 · **License:** MIT
+**Version:** 0.4.0 · **Protocol:** fabnodes/1.2 · **License:** MIT
 
 An ESP32 library for building MQTT-connected sensors and actuators. Define
 signals and hardware callbacks; the runtime handles setup, connectivity,
@@ -20,11 +20,15 @@ the directory containing `FabNodesCore`.
 ## Features
 
 - Captive-portal WiFi/MQTT setup with settings saved in ESP32 Preferences.
+  Setup mode never strands a node: it keeps retrying stored credentials and
+  leaves by itself once the broker answers.
 - Retained manifests describing each signal's topic, type, direction and range.
 - Online/offline availability through MQTT Last Will, plus diagnostic heartbeats.
 - Latched `system/estop` handling and a callback for safe output states on
   connectivity loss. This is a software stop, not a safety-rated function.
 - Typed control bindings, range checks and enum validation.
+- Optional command holds (`hold_ms`): a control that goes quiet puts the node
+  in its safe state and reports `status/hold`. Off by default.
 - Publishing policies with deadbands and minimum/maximum intervals.
 - mDNS naming and broker discovery, plus serial setup/debug commands.
 

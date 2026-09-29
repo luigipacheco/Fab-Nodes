@@ -5,7 +5,7 @@ FabNodes are modular hardware nodes designed to expose direct, human-readable ha
 
 High-level logic, scaling, mapping, and orchestration are handled externally (MQTTouch, Blender, automation systems).
 
-**Version:** 0.3.0 · **Protocol:** fabnodes/1.1 · **License:** MIT
+**Version:** 0.4.0 · **Protocol:** fabnodes/1.2 · **License:** MIT
 
 Build an ESP32 node with the FabNodesCore library and the
 [fab-hello example](examples/fab-hello/TUTORIAL.md). The runtime handles setup,
@@ -264,13 +264,15 @@ Each FabNode supports runtime configuration (no firmware reflash required).
 - MQTT broker address + port
 - MQTT username + password (optional)
 - `nodeName` — unique node identifier on the network
+- Command hold timeout (v1.2, ms, 0 = off) — see §13.1
 
 ## 7.2 Boot Sequence
 
 1. Load stored configuration from flash (`Preferences`)
 2. If WiFi or MQTT broker is unconfigured → enter setup mode
 3. Attempt WiFi connection (30 × 500 ms)
-4. If WiFi fails → enter setup mode
+4. If WiFi fails → enter setup mode, **keeping the stored credentials and
+   retrying them in the background** (§7.3.1)
 5. MQTT connection is attempted in the main loop (non-blocking)
 6. On successful MQTT connect:
    - Subscribe to all signal topics
@@ -294,11 +296,26 @@ When setup mode is triggered the node starts a WiFi Access Point and a captive p
 - Web UI at `http://192.168.4.1` — configure WiFi, broker, and node name
 - On save: settings written to flash, device restarts
 
+### 7.3.1 Setup mode is never terminal (v1.2)
+
+The portal runs in **AP+STA** mode. While it is up, a node that already has
+credentials keeps trying them every 30 s (WiFi, then the broker) and leaves
+setup mode by itself the moment the broker answers: the AP goes away, mDNS
+starts, normal operation resumes. Nothing needs a power cycle.
+
+This is what makes two very ordinary events survivable: a router that boots
+slower than the nodes after a power cut, and a broker that is down for more
+than a minute (the failure threshold in §7.4). The portal still appears in
+both cases, so a wrong broker address can be fixed on the spot, but a
+*correct* configuration recovers on its own.
+
 ## 7.4 MQTT Failure Recovery
 
 - Reconnect is attempted every 5 s (non-blocking)
 - Failures are counted inside a 60 s sliding window
-- After **12 failures within 60 s** → safe state + return to setup mode
+- After **12 failures within 60 s** → safe state + setup portal opens
+  (non-terminal, §7.3.1: the node keeps retrying underneath and closes the
+  portal when the broker is back)
 - On every reconnect attempt: reason code is logged to serial
 
 ## 7.5 WiFi Watchdog
@@ -402,12 +419,12 @@ flash to first signal on the wire; making your own node = copying this folder.
 | `<nodeName>/button` | pub | bool | BOOT button pressed/released |
 | `<nodeName>/$info` | pub | json | Node manifest (retained) |
 
-**FabNodes protocol**: v1.1 — full runtime (portal, `$state`, e-stop, diagnostics, mDNS).
+**FabNodes protocol**: v1.2 — full runtime (portal, `$state`, e-stop, diagnostics, mDNS, command hold).
 
 
 ## Shared Library (`libraries/FabNodesCore/`)
 
-`FabNodesCore` is the shared helper layer for keeping FabNodes sketches aligned on workflow, setup UI conventions, protocol constants, settings persistence, and serial/MQTT utility behavior. It covers common settings, string helpers, broker-command parsing, the `FabSignal` model, the manifest builder, and the full v1.1 layer (`$state` + LWT, latched e-stop, replay guard, diagnostics, mDNS).
+`FabNodesCore` is the shared helper layer for keeping FabNodes sketches aligned on workflow, setup UI conventions, protocol constants, settings persistence, and serial/MQTT utility behavior. It covers common settings, string helpers, broker-command parsing, the `FabSignal` model, the manifest builder, and the full v1.2 layer (`$state` + LWT, latched e-stop, replay guard, diagnostics, mDNS, command holds).
 
 **`FabNodesRuntime.h`** is the full-lifecycle layer: settings, captive portal (shared HTML), WiFi/MQTT lifecycle with fail-safe transitions, e-stop, manifest, diagnostics, and serial commands (with hooks for custom commands/status/values) in one header-only class. A node sketch is just pins + a `FabSignal[]` + callbacks (`on_control`, `on_safe_state`, `on_sample`) — see [`examples/fab-hello`](examples/fab-hello/) as the template, and `FabNodesRuntime.h` itself for the full set of hooks.
 
@@ -508,8 +525,65 @@ The semicolon form (`r,g,b;r,g,b`) is a legacy alias that existing nodes may kee
 
 # 12. Version
 
-FabNodes Protocol v1.1
+FabNodes Protocol v1.2
 Raw Scalar + Array Edition
 
-FabNodesCore library: **0.3.0** (Arduino and PlatformIO).
+FabNodesCore library: **0.4.0** (Arduino and PlatformIO).
 
+---
+
+# 13. Protocol v1.2 Additions
+
+v1.2 is additive — v1.0 and v1.1 nodes keep working; tools ignore fields they
+do not know.
+
+## 13.1 Command Hold (`hold_ms`)
+
+Fail-safe on disconnect covers a dead broker. It does not cover a dead
+**orchestrator**: if the controlling app crashes or the laptop lid closes, the
+broker stays up and every node keeps the last value it was given, forever.
+A command hold closes that gap.
+
+A `sub` signal may declare a hold in the manifest:
+
+```json
+{"topic":"fab-struder1/motorFeed/speed","dir":"sub","type":"int","min":0,"max":500,"hold_ms":2000}
+```
+
+Semantics (per signal):
+
+- The hold is **unarmed** after connect — silence before the first value is fine
+- The first value arms it; every value re-arms it
+- No value for longer than `hold_ms` → the node enters its **safe state**
+  (the same node-wide safe state as e-stop and connectivity loss) and
+  publishes `<nodeName>/status/hold = 1`
+- Controls stay accepted while held; the next value on the held signal ends
+  the hold (`status/hold = 0`). Outputs stay safe until explicitly commanded,
+  the same rule as the e-stop clear
+- `status/hold` is not retained (a rebooted node starts unarmed) and is only
+  advertised in the manifest when at least one signal holds
+
+Where the hold comes from:
+
+- **Firmware**: a `FabSignal`'s `hold_ms` field (its last field) sets a
+  per-signal hold. Reserve it for signals a node should *never* be left
+  holding blind
+- **Deployment**: the setup portal's **command hold timeout** field is a
+  node-wide default applied to every `FAB_CONTROL` sub signal without its own
+  hold. It is `0` (off) out of the box on purpose: a hold trips with any
+  publisher that only sends on change (`mosquitto_pub`, MQTT Explorer, most
+  dashboard toggles), so it is an operator's choice per node, made when there
+  is a keepalive-aware publisher driving it
+
+Publisher obligations: a tool that drives a held signal must re-send the
+current value at least every `hold_ms / 3`, even when unchanged. A publisher
+that only sends on change will trip the hold after `hold_ms` — that is the
+intended deadman behavior, not a bug.
+
+## 13.2 Name Collision Detection
+
+Two boards configured with the same `nodeName` obey the same controls and
+overwrite each other's retained manifest. The manifest's `id` (chip id) is
+the collision key: when a tool sees a manifest for a name it already knows
+carrying a different `id`, it should warn. The fix is to rename one board in
+its setup portal.

@@ -9,6 +9,7 @@ static constexpr const char* kSetupApSsid = "fabnodes";
 static constexpr const char* kManifestRoot = "fabnodes/manifest";
 static constexpr const char* kProtocolV1 = "fabnodes/1.0";
 static constexpr const char* kProtocolV11 = "fabnodes/1.1";
+static constexpr const char* kProtocolV12 = "fabnodes/1.2";
 static constexpr const char* kEstopTopic = "system/estop";
 static constexpr const char* kDefaultBrokerHost = "fabnodes.local";
 static constexpr int kDefaultMqttPort = 1883;
@@ -21,6 +22,9 @@ struct NetworkSettings {
   String mqtt_username = "";
   String mqtt_password = "";
   String node_name = "";
+  // v1.2 node-wide command hold in ms (0 = off): applies to every control
+  // signal that does not declare its own hold_ms. Set in the portal.
+  unsigned long hold_ms = 0;
 };
 
 struct BrokerEndpoint {
@@ -113,6 +117,7 @@ inline void loadNetworkSettings(Preferences& preferences, NetworkSettings& setti
   } else {
     settings.node_name = sanitizeNodeName(preferences.getString("node_name", ""));
   }
+  settings.hold_ms = preferences.getULong("hold_ms", 0);
   preferences.end();
 }
 
@@ -126,6 +131,7 @@ inline void saveNetworkSettings(Preferences& preferences, NetworkSettings& setti
   preferences.putString("mqtt_username", settings.mqtt_username);
   preferences.putString("mqtt_password", settings.mqtt_password);
   preferences.putString("node_name", settings.node_name);
+  preferences.putULong("hold_ms", settings.hold_ms);
   preferences.end();
 }
 

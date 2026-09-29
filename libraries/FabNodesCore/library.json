@@ -1,7 +1,7 @@
 {
   "name": "FabNodesCore",
-  "version": "0.3.0",
-  "description": "Shared protocol and workflow helpers for FabNodes firmware: settings persistence, protocol constants (fabnodes/1.1), signal model, manifest builder, availability ($state + LWT), latched emergency stop, diagnostics, and mDNS broker resolution.",
+  "version": "0.4.0",
+  "description": "FabNodes firmware runtime and helpers: fabnodes/1.2 manifests, settings, WiFi/MQTT recovery, availability, software stop, command holds, typed signals, diagnostics and mDNS.",
   "keywords": ["mqtt", "fabnodes", "esp32", "robotics"],
   "authors": [{ "name": "Luis Arturo Pacheco", "maintainer": true }],
   "repository": {

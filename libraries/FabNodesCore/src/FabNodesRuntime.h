@@ -5,8 +5,15 @@
 //
 // Owns: settings persistence, captive portal (shared HTML), WiFi connect and
 // watchdog, MQTT reconnect with failure window, $state LWT, latched
-// system/estop with status/safe ack, retained-control replay guard, manifest
-// publishing, standard diagnostics, mDNS, and the default serial commands.
+// system/estop with status/safe ack, retained-control replay guard, command
+// hold watchdog (v1.2), manifest publishing, standard diagnostics, mDNS, and
+// the default serial commands.
+//
+// Setup mode is never terminal: the portal AP comes up alongside the station
+// radio (AP+STA), stored credentials keep being retried in the background,
+// and the node leaves setup mode on its own the moment the broker answers.
+// So a router that boots slower than the nodes after a power cut, or a hub
+// that is down for a few minutes, never strands a fleet in AP mode.
 //
 // Not included from FabNodesCore.h on purpose: it pulls in AsyncWebServer,
 // DNSServer, and PubSubClient. New-style sketches include <FabNodesRuntime.h>.
@@ -45,6 +52,7 @@ button{margin-top:20px;width:100%;padding:12px;background:#ff6a2b;color:#fff;fon
 <label>MQTT username</label><input name="mqtt_username" value="{{mqtt_username}}">
 <label>MQTT password</label><input name="mqtt_password" type="password">
 <label>Node name (unique on your network)</label><input name="node_name" value="{{node_name}}">
+<label>Command hold timeout, ms (0 = off: go safe when a control goes quiet)</label><input name="hold_ms" value="{{hold_ms}}">
 <button type="submit">Save &amp; restart</button>
 </form></body></html>)html";
 
@@ -83,7 +91,7 @@ class FabNodeRuntime {
     cfg_ = cfg;
     instanceRef() = this;
 
-    Serial.printf("\n\n=== %s — FabNodes %s ===\n", cfg_.node_type, kProtocolV11);
+    Serial.printf("\n\n=== %s — FabNodes %s ===\n", cfg_.node_type, kProtocolV12);
     client_id_ = String(cfg_.node_type) + "_" + fabChipId();
     Serial.printf("Client ID: %s\n", client_id_.c_str());
 
@@ -95,6 +103,9 @@ class FabNodeRuntime {
       settings_.node_name = defaultNodeName(cfg_.node_type);
     }
     Serial.printf("FabNode nodeName: %s\n", settings_.node_name.c_str());
+    if (settings_.hold_ms > 0) {
+      Serial.printf("Command hold: %lu ms (node-wide default)\n", settings_.hold_ms);
+    }
 
     mqtt_.setClient(net_);
     mqtt_.setCallback(mqttTrampoline);
@@ -108,15 +119,15 @@ class FabNodeRuntime {
 
   void loop() {
     handleSerial();
+    unsigned long now = millis();
 
     if (setup_mode_) {
       dns_.processNextRequest();
-      if (cfg_.on_sample) cfg_.on_sample(millis());
+      serviceSetupRecovery(now);
+      if (cfg_.on_sample) cfg_.on_sample(now);
       delay(50);
       return;
     }
-
-    unsigned long now = millis();
 
     if (WiFi.status() != WL_CONNECTED) {
       if (was_connected_) { was_connected_ = false; enterSafe("WiFi lost"); }
@@ -129,6 +140,7 @@ class FabNodeRuntime {
       was_connected_ = true;
       mqtt_.loop();
       fabServiceDiagnostics(mqtt_, settings_.node_name, diag_, now);
+      serviceHolds(now);
     } else {
       if (was_connected_) { was_connected_ = false; enterSafe("MQTT lost"); }
       if (now - last_mqtt_attempt_ >= kMqttReconnectMs) {
@@ -232,6 +244,13 @@ class FabNodeRuntime {
   bool connected() { return mqtt_.connected(); }
   bool estopActive() const { return estop_.active; }
   bool setupMode() const { return setup_mode_; }
+  // True while any control signal's hold has tripped (outputs are safe).
+  bool holdActive() const { return hold_active_; }
+  // Effective hold for a signal (its own hold_ms, else the node-wide default).
+  unsigned long holdMs(const char* suffix) const {
+    int idx = findSignal(suffix);
+    return idx < 0 ? 0 : fabSignalHoldMs(cfg_.signals[idx], settings_.hold_ms);
+  }
   const String& nodeName() const { return settings_.node_name; }
   PubSubClient& mqtt() { return mqtt_; }
 
@@ -241,6 +260,9 @@ class FabNodeRuntime {
   static constexpr unsigned long kMqttFailWindowMs = 60000;
   static constexpr int kMqttFailThreshold = 12;
   static constexpr int kWifiAttempts = 30;
+  // Background retry cadence while the portal is up. Slow on purpose: every
+  // WiFi.begin() makes the AP radio hop channels for a moment.
+  static constexpr unsigned long kSetupRetryMs = 30000;
 
   // C++11-safe header-only singleton storage
   static FabNodeRuntime*& instanceRef() {
@@ -295,6 +317,9 @@ class FabNodeRuntime {
   FabControlReplayGuard guard_;
   FabDiagnostics diag_;
   bool setup_mode_ = false;
+  bool server_started_ = false;
+  bool mdns_started_ = false;
+  bool hold_active_ = false;
   bool was_connected_ = false;
   unsigned long last_wifi_attempt_ = 0;
   unsigned long last_mqtt_attempt_ = 0;
@@ -343,9 +368,10 @@ class FabNodeRuntime {
     String prefix = settings_.node_name + "/";
     if (!t.startsWith(prefix)) return;
     String suffix = t.substring(prefix.length());
+    int idx = findSignal(suffix.c_str());
+    if (idx >= 0) noteControl(idx, millis());
     for (const ControlBinding& b : bindings_) {
       if (b.suffix == suffix) {
-        int idx = findSignal(suffix.c_str());
         b.fn(idx >= 0 ? &cfg_.signals[idx] : nullptr, payload, length);
         return;
       }
@@ -353,8 +379,58 @@ class FabNodeRuntime {
     if (cfg_.on_control) cfg_.on_control(suffix, payload, length);
   }
 
-  void reconnectMQTT() {
-    if (WiFi.status() != WL_CONNECTED) return;
+  // ── Command hold (v1.2) ──────────────────────────────────────────────────
+  // A held control signal must be refreshed within its hold_ms or the node
+  // goes safe: fail-safe on connectivity loss covers a dead broker, this
+  // covers a dead *orchestrator* while the broker is fine. The hold is armed
+  // by the first value after connect and re-armed by every value; the next
+  // value after a trip ends it (outputs stay safe until commanded, the same
+  // rule as the e-stop clear).
+  void noteControl(int idx, unsigned long now) {
+    FabSignalRuntime& rt = sig_rt_[idx];
+    rt.last_control_ms = now ? now : 1;
+    if (rt.held) {
+      rt.held = false;
+      Serial.printf("[HOLD] %s: fresh value, hold released\n", cfg_.signals[idx].suffix);
+      refreshHoldStatus();
+    }
+  }
+
+  void serviceHolds(unsigned long now) {
+    for (size_t i = 0; i < cfg_.signal_count; i++) {
+      unsigned long hold = fabSignalHoldMs(cfg_.signals[i], settings_.hold_ms);
+      FabSignalRuntime& rt = sig_rt_[i];
+      if (hold == 0 || rt.held || rt.last_control_ms == 0) continue;
+      if (now - rt.last_control_ms <= hold) continue;
+      rt.held = true;
+      Serial.printf("[HOLD] %s: no value for %lu ms - safe state\n", cfg_.signals[i].suffix, hold);
+      enterSafe("command hold timeout");
+      refreshHoldStatus();
+    }
+  }
+
+  void resetHolds() {
+    for (FabSignalRuntime& rt : sig_rt_) { rt.last_control_ms = 0; rt.held = false; }
+    hold_active_ = false;
+  }
+
+  bool anyHoldDeclared() const {
+    for (size_t i = 0; i < cfg_.signal_count; i++) {
+      if (fabSignalHoldMs(cfg_.signals[i], settings_.hold_ms) > 0) return true;
+    }
+    return false;
+  }
+
+  void refreshHoldStatus() {
+    bool active = false;
+    for (const FabSignalRuntime& rt : sig_rt_) if (rt.held) { active = true; break; }
+    if (active == hold_active_) return;
+    hold_active_ = active;
+    publish("status/hold", active ? "1" : "0");
+  }
+
+  bool reconnectMQTT() {
+    if (WiFi.status() != WL_CONNECTED) return false;
     Serial.printf("[MQTT] Connecting to %s:%d  clientId=%s\n",
       settings_.mqtt_server.c_str(), settings_.mqtt_port, client_id_.c_str());
 
@@ -370,11 +446,14 @@ class FabNodeRuntime {
       mqtt_failures_ = 0;
       mqtt_fail_window_ = 0;
       Serial.println("[MQTT] Connected");
+      resetHolds();
       subscribeAll();
       publishManifest();
       publishSafeStatus();
       if (cfg_.on_connected) cfg_.on_connected();
-    } else {
+      return true;
+    }
+    if (!setup_mode_) {
       unsigned long now = millis();
       if (mqtt_fail_window_ == 0 || now - mqtt_fail_window_ > kMqttFailWindowMs) {
         mqtt_fail_window_ = now;
@@ -385,11 +464,16 @@ class FabNodeRuntime {
         mqtt_.state(), mqtt_failures_, kMqttFailThreshold);
       if (mqtt_failures_ >= kMqttFailThreshold &&
           now - mqtt_fail_window_ <= kMqttFailWindowMs) {
-        Serial.println("[MQTT] Repeated failures - entering setup mode");
+        // Bring the portal up so a wrong broker address can be fixed, but
+        // keep retrying underneath: a hub reboot must not need a node reboot.
+        Serial.println("[MQTT] Repeated failures - opening setup portal (still retrying)");
         enterSafe("MQTT failure threshold");
         startSetupMode();
       }
+    } else {
+      Serial.printf("[MQTT] FAILED state=%d (setup mode, retrying)\n", mqtt_.state());
     }
+    return false;
   }
 
   void subscribeAll() {
@@ -408,9 +492,11 @@ class FabNodeRuntime {
     info.node_name = settings_.node_name;
     info.node_type = cfg_.node_type;
     info.firmware_version = cfg_.fw_version;
-    info.protocol_version = kProtocolV11;
+    info.protocol_version = kProtocolV12;
     info.ip_address = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("");
     info.chip_id = fabChipId();
+    info.default_hold_ms = settings_.hold_ms;
+    info.include_hold_status = anyHoldDeclared();
 
     String payload = fabBuildManifestPayload(info, cfg_.signals, cfg_.signal_count);
     String infoTopic = fabManifestInfoTopic(settings_.node_name);
@@ -428,13 +514,14 @@ class FabNodeRuntime {
       String html = FPSTR(kPortalHtml);
       html.replace("{{node_type}}", cfg_.node_type);
       html.replace("{{fw}}", cfg_.fw_version);
-      html.replace("{{protocol}}", kProtocolV11);
+      html.replace("{{protocol}}", kProtocolV12);
       html.replace("{{wifi_ssid}}", settings_.wifi_ssid);
       html.replace("{{mqtt_server}}",
         settings_.mqtt_server.length() ? settings_.mqtt_server : String(kDefaultBrokerHost));
       html.replace("{{mqtt_port}}", String(settings_.mqtt_port));
       html.replace("{{mqtt_username}}", settings_.mqtt_username);
       html.replace("{{node_name}}", settings_.node_name);
+      html.replace("{{hold_ms}}", String(settings_.hold_ms));
       req->send(200, "text/html", html);
     });
     server_.on("/save", HTTP_POST, [this](AsyncWebServerRequest* req) {
@@ -451,6 +538,12 @@ class FabNodeRuntime {
       String mp = param("mqtt_password");
       if (mp.length() > 0) settings_.mqtt_password = mp;
       if (req->hasParam("node_name", true)) settings_.node_name = sanitizeNodeName(param("node_name"));
+      if (req->hasParam("hold_ms", true)) {
+        // 0 = off; anything else is floored at 100 ms, below which a hold
+        // is just a way to trip on every scheduler hiccup
+        long hold = param("hold_ms").toInt();
+        settings_.hold_ms = hold <= 0 ? 0 : (hold < 100 ? 100 : (unsigned long)hold);
+      }
 
       saveNetworkSettings(prefs_, settings_);
       req->send(200, "text/html",
@@ -465,24 +558,84 @@ class FabNodeRuntime {
   String processorVar(const String& var) {
     if (var == "node_type") return String(cfg_.node_type);
     if (var == "fw") return String(cfg_.fw_version);
-    if (var == "protocol") return String(kProtocolV11);
+    if (var == "protocol") return String(kProtocolV12);
     if (var == "wifi_ssid") return settings_.wifi_ssid;
     if (var == "mqtt_server")
       return settings_.mqtt_server.length() ? settings_.mqtt_server : String(kDefaultBrokerHost);
     if (var == "mqtt_port") return String(settings_.mqtt_port);
     if (var == "mqtt_username") return settings_.mqtt_username;
     if (var == "node_name") return settings_.node_name;
+    if (var == "hold_ms") return String(settings_.hold_ms);
     return String();
   }
 
+  bool hasCredentials() const {
+    return settings_.wifi_ssid.length() > 0 && settings_.mqtt_server.length() > 0;
+  }
+
+  void startWebServer() {
+    if (server_started_) return;
+    server_started_ = true;
+    server_.begin();
+  }
+
+  void startMdns() {
+    if (mdns_started_) return;
+    if (fabStartMdns(settings_.node_name)) {
+      mdns_started_ = true;
+      Serial.printf("mDNS started - %s.local\n", settings_.node_name.c_str());
+    }
+  }
+
+  // Portal up, station radio kept: stored credentials are retried by
+  // serviceSetupRecovery() and the node leaves on its own once the broker
+  // answers. Idempotent, so the MQTT failure threshold can call it freely.
   void startSetupMode() {
+    if (setup_mode_) return;
     setup_mode_ = true;
     String ap = fabSetupApSsid(settings_.node_name);
     Serial.printf("=== Setup Mode ===\nAP: %s  |  http://192.168.4.1\n", ap.c_str());
-    WiFi.mode(WIFI_AP);
+    if (hasCredentials()) {
+      Serial.println("[SETUP] Stored credentials kept - retrying in the background");
+    }
+    WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(ap.c_str());
     dns_.start(53, "*", IPAddress(192, 168, 4, 1));
-    server_.begin();
+    startWebServer();
+    last_wifi_attempt_ = millis();
+    last_mqtt_attempt_ = 0;
+  }
+
+  void leaveSetupMode() {
+    if (!setup_mode_) return;
+    setup_mode_ = false;
+    dns_.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    Serial.printf("[SETUP] Broker reachable - leaving setup mode (IP %s)\n",
+      WiFi.localIP().toString().c_str());
+    startMdns();
+    mqtt_failures_ = 0;
+    mqtt_fail_window_ = 0;
+    was_connected_ = true;
+  }
+
+  // Runs every loop while the portal is up.
+  void serviceSetupRecovery(unsigned long now) {
+    if (!hasCredentials()) return;
+    if (WiFi.status() != WL_CONNECTED) {
+      if (now - last_wifi_attempt_ >= kSetupRetryMs) {
+        last_wifi_attempt_ = now;
+        Serial.printf("[SETUP] Retrying WiFi: %s\n", settings_.wifi_ssid.c_str());
+        WiFi.begin(settings_.wifi_ssid.c_str(), settings_.wifi_password.c_str());
+      }
+      return;
+    }
+    if (mqtt_.connected()) { leaveSetupMode(); return; }
+    if (last_mqtt_attempt_ == 0 || now - last_mqtt_attempt_ >= kSetupRetryMs) {
+      last_mqtt_attempt_ = now;
+      if (reconnectMQTT()) leaveSetupMode();
+    }
   }
 
   void connectToWiFi() {
@@ -504,12 +657,10 @@ class FabNodeRuntime {
     if (WiFi.status() == WL_CONNECTED) {
       Serial.printf("WiFi connected - IP: %s RSSI: %d dBm\n",
         WiFi.localIP().toString().c_str(), WiFi.RSSI());
-      if (fabStartMdns(settings_.node_name)) {
-        Serial.printf("mDNS started - %s.local\n", settings_.node_name.c_str());
-      }
-      server_.begin();
+      startMdns();
+      startWebServer();
     } else {
-      Serial.println("WiFi failed - entering setup mode");
+      Serial.println("WiFi failed - entering setup mode (credentials still retried)");
       startSetupMode();
     }
   }
@@ -523,7 +674,7 @@ class FabNodeRuntime {
     snap.title = cfg_.node_type;
     snap.node_name = settings_.node_name;
     snap.node_type = cfg_.node_type;
-    snap.protocol_version = kProtocolV11;
+    snap.protocol_version = kProtocolV12;
     snap.wifi_connected = WiFi.status() == WL_CONNECTED;
     snap.wifi_ssid = settings_.wifi_ssid;
     snap.wifi_ip = snap.wifi_connected ? WiFi.localIP().toString() : String("");
@@ -552,6 +703,14 @@ class FabNodeRuntime {
     FabSerialCommandResult result =
       fabHandleSerialCommand(cmd, settings_.mqtt_port, snap, handlers);
 
+    {
+      String trimmed = cmd;
+      trimmed.trim();
+      if (trimmed == "status") {
+        Serial.printf("Hold: %s (node-wide %lu ms)\n",
+          hold_active_ ? "TRIPPED - outputs safe" : "ok", settings_.hold_ms);
+      }
+    }
     if (result.reset_requested) {
       Serial.println("Clearing configuration - restarting into setup mode");
       clearNetworkSettings(prefs_);

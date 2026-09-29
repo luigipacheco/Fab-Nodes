@@ -21,7 +21,7 @@ Individual production node firmware lives in separate repositories.
   template for new node types. Nothing depends on it, so it is free to stay
   maximally readable: it is teaching material first, firmware second.
 
-## Protocol rules (fabnodes/1.1 — don't casually violate)
+## Protocol rules (fabnodes/1.2 — don't casually violate)
 
 - Flat readable topics `<nodeName>/<suffix>`; raw payloads (no JSON objects
   in controls); arrays as JSON brackets `[[r,g,b],...]`
@@ -32,6 +32,11 @@ Individual production node firmware lives in separate repositories.
   before trusting "online" (stale after 45 s)
 - Enum string signals declare `options` in the manifest (`FAB_SUB_ENUM`);
   payloads stay strings like "velocity", never numeric codes
+- Command hold (v1.2): a `sub` signal with `hold_ms` goes safe when quiet;
+  publishers must re-send at least every `hold_ms/3`. Off by default;
+  per-signal in firmware, node-wide in the portal
+- Setup mode is non-terminal (AP+STA, background retry, auto-exit) — never
+  make a code path strand a node in AP mode
 - v1.x changes must be additive — old nodes keep working
 
 ## Conventions

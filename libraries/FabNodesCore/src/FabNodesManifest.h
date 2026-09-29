@@ -9,13 +9,24 @@ struct FabManifestInfo {
   String node_name = "";
   const char* node_type = "";
   const char* firmware_version = "";
-  const char* protocol_version = "fabnodes/1.1";
+  const char* protocol_version = "fabnodes/1.2";
   String ip_address = "";
   String chip_id = "";
   bool include_state = true;        // advertise <nodeName>/$state availability topic
   bool include_safe_status = true;  // advertise <nodeName>/status/safe
   bool include_diagnostics = true;  // advertise diag/rssi, diag/ip, diag/uptime
+  bool include_hold_status = false; // advertise <nodeName>/status/hold (v1.2, any signal holds)
+  unsigned long default_hold_ms = 0; // node-wide hold applied to controls without their own
 };
+
+// Effective hold for a signal: its own hold_ms, else the node-wide default
+// for control-class sub signals. Pub signals and config never hold.
+inline unsigned long fabSignalHoldMs(const FabSignal& signal, unsigned long defaultHoldMs) {
+  if (signal.dir == FAB_SIG_PUB) return 0;
+  if (signal.hold_ms > 0) return signal.hold_ms;
+  if (signal.sclass == FAB_CONTROL) return defaultHoldMs;
+  return 0;
+}
 
 inline String fabManifestInfoTopic(const String& nodeName, const char* infoPath = "/$info") {
   return nodeName + String(infoPath);
@@ -25,7 +36,8 @@ inline String fabManifestMirrorTopic(const String& nodeName, const char* manifes
   return String(manifestRoot) + "/" + nodeName;
 }
 
-inline void fabManifestAppendSignal(String& payload, const String& nodeName, const FabSignal& signal) {
+inline void fabManifestAppendSignal(String& payload, const String& nodeName, const FabSignal& signal,
+                                    unsigned long defaultHoldMs = 0) {
   payload += "{\"topic\":\"";
   payload += jsonEscape(fabSignalFullTopic(nodeName, signal));
   payload += "\",\"dir\":\"";
@@ -72,6 +84,12 @@ inline void fabManifestAppendSignal(String& payload, const String& nodeName, con
     payload += String(signal.max_value, signal.type == FAB_INT ? 0 : 3);
   }
 
+  unsigned long hold = fabSignalHoldMs(signal, defaultHoldMs);
+  if (hold > 0) {
+    payload += ",\"hold_ms\":";
+    payload += String(hold);
+  }
+
   payload += "}";
 }
 
@@ -89,11 +107,19 @@ inline void fabManifestAppendStandardSignals(String& payload, const FabManifestI
   const FabSignal kUptimeSignal =
     { "diag/uptime", FAB_SIG_PUB, FAB_INT, FAB_DIAGNOSTIC, "s", false,
       false, 0, false, 0, FAB_INTERVAL, 0, 15000, 15000, true, true };
+  const FabSignal kHoldSignal =
+    { "status/hold", FAB_SIG_PUB, FAB_BOOL, FAB_STATUS, "", false,
+      false, 0, false, 0, FAB_ON_CHANGE, 0, 0, 0, true, true };
 
   bool first = !haveSignals;
   if (info.include_safe_status) {
     if (!first) payload += ",";
     fabManifestAppendSignal(payload, info.node_name, kSafeSignal);
+    first = false;
+  }
+  if (info.include_hold_status) {
+    if (!first) payload += ",";
+    fabManifestAppendSignal(payload, info.node_name, kHoldSignal);
     first = false;
   }
   if (info.include_diagnostics) {
@@ -138,7 +164,7 @@ inline String fabBuildManifestPayload(const FabManifestInfo& info, const FabSign
   payload += ",\"signals\":[";
   for (size_t i = 0; i < signalCount; i++) {
     if (i > 0) payload += ",";
-    fabManifestAppendSignal(payload, info.node_name, signals[i]);
+    fabManifestAppendSignal(payload, info.node_name, signals[i], info.default_hold_ms);
   }
   fabManifestAppendStandardSignals(payload, info, signalCount > 0);
   payload += "]}";

@@ -54,9 +54,14 @@ struct FabSignal {
   // Optional enum options for string signals, comma-separated
   // (e.g. "velocity,move,position"). Emitted in the manifest as
   // "options":[...] so tools render a selector. Payloads stay the
-  // human-readable strings; appended last so 16-field aggregate
-  // initializers keep working (value-initialized to nullptr).
+  // human-readable strings; appended after the 16 base fields so older
+  // aggregate initializers keep working (value-initialized to nullptr).
   const char* options;
+  // v1.2 command hold (sub signals only). When > 0, the node expects a fresh
+  // value on this signal at least every hold_ms once it has received one;
+  // silence beyond that means whoever was driving it is gone, and the node
+  // enters its safe state. 0 = no hold. Appended last (value-initialized).
+  unsigned long hold_ms;
 };
 
 struct FabSignalRuntime {
@@ -76,6 +81,10 @@ struct FabSignalRuntime {
   bool dirty = false;
   bool healthy = true;
   bool stale = false;
+  // v1.2 hold bookkeeping for sub signals: millis() of the last accepted
+  // control value (0 = none since connect) and whether the hold has tripped.
+  unsigned long last_control_ms = 0;
+  bool held = false;
 };
 
 inline const char* fabSignalDirName(FabSignalDir dir) {
